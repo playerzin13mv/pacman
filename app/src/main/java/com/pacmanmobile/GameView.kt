@@ -8,24 +8,29 @@ import android.graphics.Color
 import android.graphics.ColorMatrix
 import android.graphics.ColorMatrixColorFilter
 import android.graphics.Paint
+import android.graphics.Path
 import android.graphics.Rect
 import android.graphics.RectF
 import android.graphics.Typeface
 import android.view.MotionEvent
 import android.view.View
 import kotlin.math.abs
+import kotlin.math.cos
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.sin
+import kotlin.math.sqrt
 
 /**
  * Desenha tudo numa tela lógica de 224x288 (como o arcade) e escala para o celular
  * sem suavização, para manter o pixel art nítido.
+ * Controles: arrastar o dedo ou D-Pad (escolhido nas configurações).
  */
 class GameView(ctx: Context) : View(ctx) {
 
     private val sfx = Sfx(ctx)
-    private val game = Game(sfx, ctx.getSharedPreferences("pacman", Context.MODE_PRIVATE))
+    private val prefs = ctx.getSharedPreferences("pacman", Context.MODE_PRIVATE)
+    private val game = Game(sfx, prefs)
 
     private val sprites: Bitmap
     private val mazeBmp: Bitmap
@@ -34,16 +39,38 @@ class GameView(ctx: Context) : View(ctx) {
     private val whitePaint = Paint()
     private val fill = Paint(Paint.ANTI_ALIAS_FLAG)
     private val text = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val stroke = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val dp = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val path = Path()
     private val src = Rect()
     private val dst = RectF()
+    private val rect = RectF()
 
     private var last = 0L
     private var paused = false
 
+    // toque
     private var sx = 0f
     private var sy = 0f
     private var moved = false
     private val swipeThr = resources.displayMetrics.density * 20f
+
+    // configurações
+    private var settingsOpen = false
+    private var ctrlMode = 0      // 0 = arrastar, 1 = D-Pad
+    private var dpadSide = 1      // 0 = esquerda, 1 = centro, 2 = direita
+    private var ghostLvl = 1      // 0 = lento, 1 = normal, 2 = rápido
+    private var soundOn = true
+    private val ghostMuls = floatArrayOf(0.6f, 0.75f, 1.0f)
+
+    // layout (calculado em layout())
+    private var scale = 1f
+    private var offX = 0f
+    private var offY = 0f
+    private var dSize = 0f
+    private var dCx = 0f
+    private var dCy = 0f
+    private var dpadDir = -1
 
     private val dotColor = Color.rgb(255, 183, 174)
     private val yellow = Color.rgb(255, 255, 0)
@@ -67,7 +94,55 @@ class GameView(ctx: Context) : View(ctx) {
             )
         )
         text.typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
+        stroke.style = Paint.Style.STROKE
         setBackgroundColor(Color.BLACK)
+        loadSettings()
+    }
+
+    // ------------------------------------------------------------ configurações
+
+    private fun loadSettings() {
+        ctrlMode = prefs.getInt("ctrl", 0).coerceIn(0, 1)
+        dpadSide = prefs.getInt("dside", 1).coerceIn(0, 2)
+        ghostLvl = prefs.getInt("ghost", 1).coerceIn(0, 2)
+        soundOn = prefs.getBoolean("sound", true)
+        applySettings()
+    }
+
+    private fun applySettings() {
+        game.ghostMult = ghostMuls[ghostLvl]
+        sfx.enabled = soundOn
+        if (!soundOn) sfx.stopLoop()
+    }
+
+    private fun saveSettings() {
+        prefs.edit()
+            .putInt("ctrl", ctrlMode)
+            .putInt("dside", dpadSide)
+            .putInt("ghost", ghostLvl)
+            .putBoolean("sound", soundOn)
+            .apply()
+        applySettings()
+    }
+
+    private fun openSettings() {
+        settingsOpen = true
+        dpadDir = -1
+        sfx.stopLoop()
+    }
+
+    private fun closeSettings() {
+        settingsOpen = false
+        last = 0L
+    }
+
+    /** Chamado pelo botão Voltar do celular. Retorna true se tratou o clique. */
+    fun onBack(): Boolean {
+        if (settingsOpen) {
+            closeSettings()
+            return true
+        }
+        return false
     }
 
     fun onPauseGame() {
@@ -85,10 +160,78 @@ class GameView(ctx: Context) : View(ctx) {
         sfx.release()
     }
 
+    // ------------------------------------------------------------ layout
+
+    private fun layout() {
+        val w = width.toFloat()
+        val h = height.toFloat()
+        if (ctrlMode == 1) {
+            dSize = min(w * 0.62f, h * 0.30f)
+            val pad = h * 0.03f
+            val bottomGap = h * 0.02f
+            val availH = h - dSize - pad * 2f - bottomGap
+            scale = min(w / 224f, availH / 288f)
+            offX = (w - 224f * scale) / 2f
+            offY = max(0f, (availH - 288f * scale) / 2f)
+            dCy = h - pad - bottomGap - dSize / 2f
+            dCx = when (dpadSide) {
+                0 -> dSize / 2f + w * 0.04f
+                2 -> w - dSize / 2f - w * 0.04f
+                else -> w / 2f
+            }
+        } else {
+            scale = min(w / 224f, h / 288f)
+            offX = (w - 224f * scale) / 2f
+            offY = (h - 288f * scale) / 2f
+        }
+    }
+
     // ------------------------------------------------------------ toque
 
+    private fun dpadDirAt(x: Float, y: Float): Int {
+        val dx = x - dCx
+        val dy = y - dCy
+        val r = sqrt(dx * dx + dy * dy)
+        if (r > dSize * 0.65f || r < dSize * 0.10f) return -1
+        return if (abs(dx) > abs(dy)) {
+            if (dx > 0) Dir.R else Dir.L
+        } else {
+            if (dy > 0) Dir.D else Dir.U
+        }
+    }
+
+    private fun scanDpad(e: MotionEvent, skip: Int) {
+        var found = -1
+        for (i in 0 until e.pointerCount) {
+            if (i == skip) continue
+            val d = dpadDirAt(e.getX(i), e.getY(i))
+            if (d >= 0) found = d
+        }
+        dpadDir = found
+        if (found >= 0) game.swipe(found)
+    }
+
     override fun onTouchEvent(e: MotionEvent): Boolean {
-        when (e.actionMasked) {
+        layout()
+        val act = e.actionMasked
+
+        if (settingsOpen) {
+            if (act == MotionEvent.ACTION_UP) {
+                settingsTap((e.x - offX) / scale, (e.y - offY) / scale)
+            }
+            return true
+        }
+
+        if (ctrlMode == 1) {
+            when (act) {
+                MotionEvent.ACTION_DOWN, MotionEvent.ACTION_MOVE, MotionEvent.ACTION_POINTER_DOWN ->
+                    scanDpad(e, -1)
+                MotionEvent.ACTION_POINTER_UP -> scanDpad(e, e.actionIndex)
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> dpadDir = -1
+            }
+        }
+
+        when (act) {
             MotionEvent.ACTION_DOWN -> {
                 sx = e.x
                 sy = e.y
@@ -98,22 +241,47 @@ class GameView(ctx: Context) : View(ctx) {
                 val dx = e.x - sx
                 val dy = e.y - sy
                 if (max(abs(dx), abs(dy)) > swipeThr) {
-                    val d = if (abs(dx) > abs(dy)) {
-                        if (dx > 0) Dir.R else Dir.L
-                    } else {
-                        if (dy > 0) Dir.D else Dir.U
-                    }
-                    game.swipe(d)
-                    sx = e.x
-                    sy = e.y
                     moved = true
+                    if (ctrlMode == 0) {
+                        val d = if (abs(dx) > abs(dy)) {
+                            if (dx > 0) Dir.R else Dir.L
+                        } else {
+                            if (dy > 0) Dir.D else Dir.U
+                        }
+                        game.swipe(d)
+                        sx = e.x
+                        sy = e.y
+                    }
                 }
             }
             MotionEvent.ACTION_UP -> {
-                if (!moved) game.tap()
+                if (!moved) {
+                    val lx = (e.x - offX) / scale
+                    val ly = (e.y - offY) / scale
+                    val gx = lx - GEAR_X
+                    val gy = ly - GEAR_Y
+                    if (gx * gx + gy * gy < 16f * 16f) openSettings() else game.tap()
+                }
             }
         }
         return true
+    }
+
+    private fun settingsTap(lx: Float, ly: Float) {
+        for (i in 0 until 4) {
+            val y0 = ROW_Y0 + i * ROW_STEP
+            if (lx in 12f..212f && ly in y0..(y0 + 28f)) {
+                when (i) {
+                    0 -> ctrlMode = 1 - ctrlMode
+                    1 -> dpadSide = (dpadSide + 1) % 3
+                    2 -> ghostLvl = (ghostLvl + 1) % 3
+                    3 -> soundOn = !soundOn
+                }
+                saveSettings()
+                return
+            }
+        }
+        if (lx in 62f..162f && ly in 220f..248f) closeSettings()
     }
 
     // ------------------------------------------------------------ desenho
@@ -123,17 +291,18 @@ class GameView(ctx: Context) : View(ctx) {
         var dt = if (last == 0L) 0f else (now - last) / 1_000_000_000f
         last = now
         if (dt > 0.05f) dt = 0.05f
-        if (!paused) game.update(dt)
+        if (!paused && !settingsOpen) game.update(dt)
 
+        layout()
         c.drawColor(Color.BLACK)
-        val s = min(width / 224f, height / 288f)
-        val ox = (width - 224f * s) / 2f
-        val oy = (height - 288f * s) / 2f
         c.save()
-        c.translate(ox, oy)
-        c.scale(s, s)
+        c.translate(offX, offY)
+        c.scale(scale, scale)
         drawWorld(c)
+        if (settingsOpen) drawSettings(c)
         c.restore()
+
+        if (ctrlMode == 1 && !settingsOpen) drawDpad(c)
 
         if (!paused) postInvalidateOnAnimation()
     }
@@ -154,6 +323,19 @@ class GameView(ctx: Context) : View(ctx) {
         c.drawText(s, x, y, text)
     }
 
+    private fun drawGear(c: Canvas) {
+        stroke.color = Color.rgb(190, 190, 190)
+        stroke.strokeWidth = 1.8f
+        c.drawCircle(GEAR_X, GEAR_Y, 4.2f, stroke)
+        stroke.strokeWidth = 2.4f
+        for (k in 0 until 8) {
+            val a = k * Math.PI / 4.0
+            val ca = cos(a).toFloat()
+            val sa = sin(a).toFloat()
+            c.drawLine(GEAR_X + ca * 5.2f, GEAR_Y + sa * 5.2f, GEAR_X + ca * 7.4f, GEAR_Y + sa * 7.4f, stroke)
+        }
+    }
+
     private fun drawHud(c: Canvas) {
         val g = game
         val white = Color.WHITE
@@ -163,6 +345,7 @@ class GameView(ctx: Context) : View(ctx) {
         label(c, g.score.toString(), 64f, 21f, white, 13f, Paint.Align.RIGHT)
         label(c, "HIGH SCORE", 112f, 10f, white, 13f, Paint.Align.CENTER)
         label(c, g.hi.toString(), 112f, 21f, white, 13f, Paint.Align.CENTER)
+        drawGear(c)
 
         // vidas
         if (g.state != Game.S.TITLE) {
@@ -207,6 +390,7 @@ class GameView(ctx: Context) : View(ctx) {
                 }
             }
         }
+        fill.isAntiAlias = true
 
         c.save()
         c.clipRect(0f, 24f, 224f, 272f)
@@ -297,6 +481,104 @@ class GameView(ctx: Context) : View(ctx) {
         if (((t * 2f).toInt() and 1) == 0) {
             label(c, "TOQUE PARA JOGAR", 112f, 192f, Color.WHITE, 12f, Paint.Align.CENTER)
         }
-        label(c, "ARRASTE O DEDO PARA MOVER", 112f, 212f, Color.LTGRAY, 9f, Paint.Align.CENTER)
+        val hint = if (ctrlMode == 0) "ARRASTE O DEDO PARA MOVER" else "USE O D-PAD PARA MOVER"
+        label(c, hint, 112f, 212f, Color.LTGRAY, 9f, Paint.Align.CENTER)
+        label(c, "ENGRENAGEM = CONFIGURACOES", 112f, 230f, Color.GRAY, 8f, Paint.Align.CENTER)
+    }
+
+    // ------------------------------------------------------------ tela de configurações
+
+    private fun drawSettings(c: Canvas) {
+        fill.color = Color.argb(245, 0, 0, 0)
+        c.drawRect(0f, 0f, 224f, 288f, fill)
+        label(c, "CONFIGURACOES", 112f, 40f, yellow, 15f, Paint.Align.CENTER)
+
+        val names = arrayOf("CONTROLE", "LADO DO D-PAD", "FANTASMAS", "SOM")
+        val values = arrayOf(
+            if (ctrlMode == 0) "ARRASTAR" else "D-PAD",
+            arrayOf("ESQUERDO", "CENTRO", "DIREITO")[dpadSide],
+            arrayOf("LENTO", "NORMAL", "RAPIDO")[ghostLvl],
+            if (soundOn) "LIGADO" else "DESLIGADO"
+        )
+        for (i in 0 until 4) {
+            val y0 = ROW_Y0 + i * ROW_STEP
+            val dim = i == 1 && ctrlMode == 0
+            stroke.color = if (dim) Color.rgb(40, 40, 110) else Color.rgb(33, 33, 255)
+            stroke.strokeWidth = 1.5f
+            rect.set(12f, y0, 212f, y0 + 28f)
+            c.drawRoundRect(rect, 4f, 4f, stroke)
+            label(c, names[i], 20f, y0 + 18f, if (dim) Color.DKGRAY else Color.WHITE, 9f, Paint.Align.LEFT)
+            label(c, values[i], 204f, y0 + 18f, if (dim) Color.DKGRAY else yellow, 10f, Paint.Align.RIGHT)
+        }
+
+        stroke.color = yellow
+        rect.set(62f, 220f, 162f, 248f)
+        c.drawRoundRect(rect, 4f, 4f, stroke)
+        label(c, "VOLTAR", 112f, 238f, yellow, 12f, Paint.Align.CENTER)
+
+        label(c, "TOQUE NA LINHA PARA TROCAR", 112f, 272f, Color.GRAY, 8f, Paint.Align.CENTER)
+    }
+
+    // ------------------------------------------------------------ D-Pad
+
+    private fun drawArrow(c: Canvas, d: Int, px: Float, py: Float, k: Float) {
+        path.reset()
+        when (d) {
+            Dir.R -> {
+                path.moveTo(px - k, py - k); path.lineTo(px + k, py); path.lineTo(px - k, py + k)
+            }
+            Dir.L -> {
+                path.moveTo(px + k, py - k); path.lineTo(px - k, py); path.lineTo(px + k, py + k)
+            }
+            Dir.U -> {
+                path.moveTo(px - k, py + k); path.lineTo(px, py - k); path.lineTo(px + k, py + k)
+            }
+            else -> {
+                path.moveTo(px - k, py - k); path.lineTo(px, py + k); path.lineTo(px + k, py - k)
+            }
+        }
+        path.close()
+        c.drawPath(path, dp)
+    }
+
+    private fun drawDpad(c: Canvas) {
+        val ds = dSize
+        val arm = ds * 0.34f
+        val r = arm * 0.30f
+        dp.style = Paint.Style.FILL
+
+        // base em cruz
+        dp.color = Color.argb(200, 45, 45, 45)
+        rect.set(dCx - ds / 2f, dCy - arm / 2f, dCx + ds / 2f, dCy + arm / 2f)
+        c.drawRoundRect(rect, r, r, dp)
+        rect.set(dCx - arm / 2f, dCy - ds / 2f, dCx + arm / 2f, dCy + ds / 2f)
+        c.drawRoundRect(rect, r, r, dp)
+
+        // direção pressionada
+        if (dpadDir >= 0) {
+            dp.color = Color.argb(170, 255, 255, 0)
+            when (dpadDir) {
+                Dir.R -> rect.set(dCx, dCy - arm / 2f, dCx + ds / 2f, dCy + arm / 2f)
+                Dir.L -> rect.set(dCx - ds / 2f, dCy - arm / 2f, dCx, dCy + arm / 2f)
+                Dir.U -> rect.set(dCx - arm / 2f, dCy - ds / 2f, dCx + arm / 2f, dCy)
+                else -> rect.set(dCx - arm / 2f, dCy, dCx + arm / 2f, dCy + ds / 2f)
+            }
+            c.drawRoundRect(rect, r, r, dp)
+        }
+
+        // setas
+        dp.color = Color.argb(230, 220, 220, 220)
+        val off = ds * 0.31f
+        val k = ds * 0.06f
+        for (d in 0..3) {
+            drawArrow(c, d, dCx + Dir.DX[d] * off, dCy + Dir.DY[d] * off, k)
+        }
+    }
+
+    companion object {
+        private const val GEAR_X = 208f
+        private const val GEAR_Y = 12f
+        private const val ROW_Y0 = 62f
+        private const val ROW_STEP = 38f
     }
 }

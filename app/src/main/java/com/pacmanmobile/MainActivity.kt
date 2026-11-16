@@ -52,6 +52,14 @@ class MainActivity : Activity() {
         if (hasFocus) hideSystemUi()
     }
 
+    @Deprecated("Deprecated in Java")
+    override fun onBackPressed() {
+        if (!view.onBack()) {
+            @Suppress("DEPRECATION")
+            super.onBackPressed()
+        }
+    }
+
     override fun onPause() {
         super.onPause()
         view.onPauseGame()

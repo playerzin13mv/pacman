@@ -514,7 +514,15 @@ class Game(private val sfx: Sfx?, private val prefs: SharedPreferences?) {
         else -> 1f
     }
 
-    private fun ghostSpd(g: Ghost): Float = when {
+    /** Multiplicador de velocidade dos fantasmas (configurável no jogo). */
+    var ghostMult = 0.75f
+
+    private fun ghostSpd(g: Ghost): Float {
+        val v = rawGhostSpd(g)
+        return if (g.state == GState.EYES) v else v * ghostMult
+    }
+
+    private fun rawGhostSpd(g: Ghost): Float = when {
         g.state == GState.EYES -> 14f
         g.state == GState.WAIT -> 0f
         g.state == GState.LEAVE -> base * 0.45f

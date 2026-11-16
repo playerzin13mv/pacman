@@ -42,13 +42,17 @@ class Sfx(ctx: Context) {
         for (i in 0..4) reg("siren$i", "siren$i")
     }
 
+    var enabled = true
+
     fun play(name: String) {
+        if (!enabled) return
         val id = ids[name] ?: return
         pool.play(id, 1f, 1f, 1, 0, 1f)
     }
 
     /** Toca um som em loop; só troca se for outro. */
     fun loop(name: String) {
+        if (!enabled) return
         if (loopName == name) return
         stopLoop()
         val id = ids[name] ?: return
